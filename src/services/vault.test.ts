@@ -4,6 +4,7 @@ import {
   VaultError,
   VAULT_KEY,
   LEGACY_KEY,
+  LEGACY_BACKUP_KEY,
   type VaultStorage,
 } from '@/services/vault'
 import type { WindowScene } from '@/types'
@@ -477,5 +478,165 @@ describe('多标签页并发', () => {
     await fresh.unlock(PW)
     const ids = fresh.getScenes().map((s) => s.id)
     expect(ids).not.toContain(doomed.id)
+  })
+
+  it('两个页面几乎同时保存,两边的记录都保留', async () => {
+    const { tabA, tabB } = await twoTabs()
+    // 并发触发,让两次写在加密的 await 间隙中交错
+    await Promise.all([
+      tabA.addScene(makeScene({ note: 'A 页第一条' })),
+      tabB.addScene(makeScene({ note: 'B 页第一条' })),
+    ])
+    await Promise.all([
+      tabB.addScene(makeScene({ note: 'B 页第二条' })),
+      tabA.addScene(makeScene({ note: 'A 页第二条' })),
+    ])
+    await Promise.all([
+      tabA.addScene(makeScene({ note: 'A 页第三条' })),
+      tabB.addScene(makeScene({ note: 'B 页第三条' })),
+    ])
+
+    const fresh = makeVault(storage)
+    await fresh.unlock(PW)
+    const notes = fresh.getScenes().map((s) => s.note)
+    for (const note of [
+      'A 页第一条',
+      'B 页第一条',
+      'A 页第二条',
+      'B 页第二条',
+      'A 页第三条',
+      'B 页第三条',
+    ]) {
+      expect(notes).toContain(note)
+    }
+    // 加上 setup 时已有的一条,一共 7 条,一条不丢
+    expect(fresh.getScenes()).toHaveLength(7)
+  })
+
+  it('同一页面连续快速保存也不丢记录', async () => {
+    const vault = makeVault(storage)
+    await vault.setup(PW)
+    await Promise.all([
+      vault.addScene(makeScene({ note: '快一' })),
+      vault.addScene(makeScene({ note: '快二' })),
+      vault.addScene(makeScene({ note: '快三' })),
+    ])
+    vault.lock()
+    await vault.unlock(PW)
+    const notes = vault.getScenes().map((s) => s.note)
+    expect(notes).toContain('快一')
+    expect(notes).toContain('快二')
+    expect(notes).toContain('快三')
+  })
+})
+
+describe('整体篡改', () => {
+  async function vaultWithTwoScenes() {
+    const vault = makeVault(storage)
+    await vault.setup(PW)
+    await vault.addScene(makeScene({ note: '第一条' }))
+    await vault.addScene(makeScene({ note: '第二条' }))
+    vault.lock()
+    return vault
+  }
+
+  it('拿掉整条记录:重新解锁报错而不是悄悄少一条', async () => {
+    const vault = await vaultWithTwoScenes()
+    const file = readVaultFile(storage) as { records: unknown[] }
+    file.records.splice(0, 1)
+    storage.setItem(VAULT_KEY, JSON.stringify(file))
+
+    await expect(vault.unlock(PW)).rejects.toMatchObject({ code: 'VAULT_CORRUPTED' })
+    expect(vault.getStatus()).toBe('locked')
+  })
+
+  it('调整记录顺序:重新解锁报错', async () => {
+    const vault = await vaultWithTwoScenes()
+    const file = readVaultFile(storage) as { records: unknown[] }
+    file.records.reverse()
+    storage.setItem(VAULT_KEY, JSON.stringify(file))
+
+    await expect(vault.unlock(PW)).rejects.toMatchObject({ code: 'VAULT_CORRUPTED' })
+  })
+
+  it('剥掉完整性签名:重新解锁报错', async () => {
+    const vault = await vaultWithTwoScenes()
+    const file = readVaultFile(storage) as Record<string, unknown>
+    delete file.manifest
+    storage.setItem(VAULT_KEY, JSON.stringify(file))
+
+    await expect(vault.unlock(PW)).rejects.toMatchObject({ code: 'VAULT_CORRUPTED' })
+  })
+
+  it('改动删除墓碑:重新解锁报错', async () => {
+    const vault = makeVault(storage)
+    await vault.setup(PW)
+    const doomed = makeScene()
+    await vault.addScene(doomed)
+    await vault.deleteScene(doomed.id)
+    vault.lock()
+
+    const file = readVaultFile(storage) as unknown as { tombstones: string[] }
+    file.tombstones = [] // 抹掉墓碑,试图让被删记录复活
+    storage.setItem(VAULT_KEY, JSON.stringify(file))
+
+    await expect(vault.unlock(PW)).rejects.toMatchObject({ code: 'VAULT_CORRUPTED' })
+  })
+
+  it('塞入一条伪造记录:重新解锁报错', async () => {
+    const vault = await vaultWithTwoScenes()
+    const file = readVaultFile(storage) as { records: unknown[] }
+    file.records.push({ id: 'forged', iv: 'AAAA', ct: 'BBBB' })
+    storage.setItem(VAULT_KEY, JSON.stringify(file))
+
+    await expect(vault.unlock(PW)).rejects.toMatchObject({ code: 'VAULT_CORRUPTED' })
+  })
+})
+
+describe('非法旧明文', () => {
+  it('旧明文不是合法数组:设置口令后本地只剩密文,不留明文备份', async () => {
+    storage.setItem(LEGACY_KEY, '{{{这不是合法JSON,包含秘密碎片XYZZY')
+
+    const vault = makeVault(storage)
+    await vault.setup(PW)
+
+    // 两个明文 key 都被清除,不存在任何备份 key
+    expect(storage.getItem(LEGACY_KEY)).toBeNull()
+    expect(storage.getItem(LEGACY_BACKUP_KEY)).toBeNull()
+    // 本地所有存储内容里都没有明文碎片
+    const allStored = Array.from(storage.map.values()).join('\n')
+    expect(allStored).not.toContain('秘密碎片XYZZY')
+    expect(allStored).not.toContain('这不是合法JSON')
+    // 保险箱本身正常可用
+    expect(vault.getStatus()).toBe('unlocked')
+    expect(vault.getScenes()).toEqual([])
+    vault.lock()
+    await vault.unlock(PW)
+    expect(vault.getScenes()).toEqual([])
+  })
+
+  it('旧明文是合法 JSON 但不是数组:同样加密收存,不留明文', async () => {
+    storage.setItem(LEGACY_KEY, JSON.stringify({ secret: '对象里的秘密DATA' }))
+    const vault = makeVault(storage)
+    await vault.setup(PW)
+
+    expect(storage.getItem(LEGACY_KEY)).toBeNull()
+    expect(Array.from(storage.map.values()).join('\n')).not.toContain('对象里的秘密DATA')
+    vault.lock()
+    await vault.unlock(PW)
+    expect(vault.getCorruptedCount()).toBe(0)
+  })
+
+  it('上一版留下的明文备份 key 也会被清理收存', async () => {
+    const vault = makeVault(storage)
+    await vault.setup(PW)
+    vault.lock()
+
+    // 模拟上一版遗留的明文备份
+    storage.setItem(LEGACY_BACKUP_KEY, '旧版备份里的明文BACKUP')
+    await vault.unlock(PW)
+
+    expect(storage.getItem(LEGACY_BACKUP_KEY)).toBeNull()
+    expect(Array.from(storage.map.values()).join('\n')).not.toContain('旧版备份里的明文BACKUP')
   })
 })

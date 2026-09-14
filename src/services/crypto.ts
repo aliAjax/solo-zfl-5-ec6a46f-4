@@ -60,6 +60,33 @@ export async function deriveKey(
   )
 }
 
+/** 派生独立的 HMAC 密钥(与数据加密密钥使用不同的盐),用于保险箱整体完整性签名 */
+export async function deriveMacKey(
+  passphrase: string,
+  salt: Uint8Array,
+  iterations: number,
+): Promise<CryptoKey> {
+  const material = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(passphrase) as BufferSource,
+    'PBKDF2',
+    false,
+    ['deriveKey'],
+  )
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: salt as BufferSource, iterations, hash: 'SHA-256' },
+    material,
+    { name: 'HMAC', hash: 'SHA-256', length: 256 },
+    false,
+    ['sign'],
+  )
+}
+
+export async function hmacSign(key: CryptoKey, text: string): Promise<string> {
+  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(text) as BufferSource)
+  return bytesToBase64(new Uint8Array(sig))
+}
+
 export interface CipherEnvelope {
   iv: string
   ct: string
