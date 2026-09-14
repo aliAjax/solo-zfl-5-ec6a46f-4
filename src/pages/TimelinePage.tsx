@@ -28,8 +28,8 @@ export default function TimelinePage() {
     (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
   )
 
-  const handleDelete = (id: string) => {
-    deleteScene(id)
+  const handleDelete = async (id: string) => {
+    await deleteScene(id)
     setDetailScene(null)
   }
 

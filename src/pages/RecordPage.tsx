@@ -36,9 +36,9 @@ export default function RecordPage() {
   const update = <K extends keyof SceneFormData>(key: K, val: SceneFormData[K]) =>
     setForm((prev) => ({ ...prev, [key]: val }))
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    saveScene(form)
+    await saveScene(form)
     setShowSuccess(true)
     setTimeout(() => {
       setShowSuccess(false)

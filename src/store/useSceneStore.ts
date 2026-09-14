@@ -1,13 +1,6 @@
 import { create } from 'zustand'
 import type { WindowScene, SceneFormData } from '@/types'
-import {
-  getAllScenes,
-  saveScene as storageSaveScene,
-  deleteScene as storageDeleteScene,
-  getScenesByRoute,
-  getAllRouteNames,
-  getRandomScene,
-} from '@/services/storage'
+import { vault } from '@/services/vault'
 
 interface SceneState {
   scenes: WindowScene[]
@@ -17,13 +10,29 @@ interface SceneState {
   randomScene: WindowScene | null
 
   loadAll: () => void
-  saveScene: (data: SceneFormData) => void
-  deleteScene: (id: string) => void
+  saveScene: (data: SceneFormData) => Promise<void>
+  deleteScene: (id: string) => Promise<void>
   selectRoute: (routeName: string) => void
   refreshRandom: () => void
+  clearAll: () => void
 }
 
-export const useSceneStore = create<SceneState>((set) => ({
+function byRoute(scenes: WindowScene[], routeName: string): WindowScene[] {
+  return scenes
+    .filter((s) => s.routeName === routeName)
+    .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+}
+
+function routeNamesOf(scenes: WindowScene[]): string[] {
+  return Array.from(new Set(scenes.map((s) => s.routeName))).sort()
+}
+
+/** 保险箱锁定期间一律视为无数据,绝不读写本地存储 */
+function readScenes(): WindowScene[] {
+  return vault.getStatus() === 'unlocked' ? vault.getScenes() : []
+}
+
+export const useSceneStore = create<SceneState>((set, get) => ({
   scenes: [],
   routeNames: [],
   currentRouteScenes: [],
@@ -31,45 +40,52 @@ export const useSceneStore = create<SceneState>((set) => ({
   randomScene: null,
 
   loadAll: () => {
-    const scenes = getAllScenes()
-    const routeNames = getAllRouteNames()
-    set({ scenes, routeNames })
+    const scenes = readScenes()
+    const { selectedRoute } = get()
+    set({
+      scenes,
+      routeNames: routeNamesOf(scenes),
+      currentRouteScenes: selectedRoute ? byRoute(scenes, selectedRoute) : [],
+    })
   },
 
-  saveScene: (data: SceneFormData) => {
+  saveScene: async (data: SceneFormData) => {
     const scene: WindowScene = {
       ...data,
       id: crypto.randomUUID(),
       timestamp: new Date().toISOString(),
     }
-    storageSaveScene(scene)
-    const scenes = getAllScenes()
-    const routeNames = getAllRouteNames()
-    set((state) => {
-      const currentRouteScenes =
-        state.selectedRoute ? getScenesByRoute(state.selectedRoute) : []
-      return { scenes, routeNames, currentRouteScenes }
-    })
+    await vault.addScene(scene)
+    get().loadAll()
   },
 
-  deleteScene: (id: string) => {
-    storageDeleteScene(id)
-    const scenes = getAllScenes()
-    const routeNames = getAllRouteNames()
-    set((state) => {
-      const currentRouteScenes =
-        state.selectedRoute ? getScenesByRoute(state.selectedRoute) : []
-      return { scenes, routeNames, currentRouteScenes }
-    })
+  deleteScene: async (id: string) => {
+    await vault.deleteScene(id)
+    get().loadAll()
   },
 
   selectRoute: (routeName: string) => {
-    const currentRouteScenes = routeName ? getScenesByRoute(routeName) : []
-    set({ selectedRoute: routeName, currentRouteScenes })
+    const scenes = readScenes()
+    set({
+      selectedRoute: routeName,
+      currentRouteScenes: routeName ? byRoute(scenes, routeName) : [],
+    })
   },
 
   refreshRandom: () => {
-    const randomScene = getRandomScene()
+    const scenes = readScenes()
+    const randomScene =
+      scenes.length === 0 ? null : scenes[Math.floor(Math.random() * scenes.length)]
     set({ randomScene })
+  },
+
+  clearAll: () => {
+    set({
+      scenes: [],
+      routeNames: [],
+      currentRouteScenes: [],
+      selectedRoute: '',
+      randomScene: null,
+    })
   },
 }))
