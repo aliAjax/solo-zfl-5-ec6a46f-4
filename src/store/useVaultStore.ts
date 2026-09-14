@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { vault, VaultError, type VaultStatus } from '@/services/vault'
+import { vault, VaultError, VAULT_KEY, type VaultStatus } from '@/services/vault'
 import { useSceneStore } from './useSceneStore'
 
 export type VaultViewStatus = VaultStatus
@@ -30,6 +30,8 @@ function errorMessage(err: unknown): string {
         return '口令至少需要 4 个字符'
       case 'STORAGE_FULL':
         return '本地存储写入失败,已有数据未受影响'
+      case 'VAULT_CHANGED':
+        return '保险箱已在其他窗口更改口令,请用新口令重新解锁'
       case 'LOCKED':
         return '保险箱未解锁'
       default:
@@ -47,6 +49,7 @@ export const useVaultStore = create<VaultState>((set) => ({
 
   init: () => {
     set({ status: vault.getStatus() })
+    watchExternalChanges(set)
   },
 
   setup: async (passphrase: string) => {
@@ -95,3 +98,24 @@ export const useVaultStore = create<VaultState>((set) => ({
 
   clearError: () => set({ error: null }),
 }))
+
+/**
+ * 监听其他标签页对保险箱的改写(storage 事件只在别的标签页触发)。
+ * 别的页面换了口令后,本页立即锁定并清空内存明文,以新口令为准。
+ */
+let watching = false
+function watchExternalChanges(set: (partial: Partial<VaultState>) => void) {
+  if (watching || typeof window === 'undefined') return
+  watching = true
+  window.addEventListener('storage', (event) => {
+    if (event.key !== VAULT_KEY) return
+    if (vault.getStatus() !== 'unlocked' || !vault.hasExternalChanges()) return
+    vault.lock()
+    useSceneStore.getState().clearAll()
+    set({
+      status: 'locked',
+      corruptedCount: 0,
+      error: '保险箱已在其他窗口更改口令,请用新口令重新解锁',
+    })
+  })
+}

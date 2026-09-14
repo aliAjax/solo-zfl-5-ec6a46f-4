@@ -25,6 +25,7 @@ export default function RecordPage() {
   const [form, setForm] = useState<SceneFormData>(initialForm)
   const [now, setNow] = useState(new Date())
   const [showSuccess, setShowSuccess] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   useEffect(() => { loadAll() }, [loadAll])
 
@@ -38,7 +39,14 @@ export default function RecordPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    await saveScene(form)
+    setSaveError(null)
+    try {
+      await saveScene(form)
+    } catch {
+      // 保存失败(如保险箱已在其他窗口更改):表单内容保留,明确提示
+      setSaveError('保存失败:保险箱状态已变化,请锁定后用新口令重新解锁再试')
+      return
+    }
     setShowSuccess(true)
     setTimeout(() => {
       setShowSuccess(false)
@@ -145,6 +153,12 @@ export default function RecordPage() {
           <Clock className="w-3 h-3" />
           <span>{formatTimestamp(now.toISOString())}</span>
         </div>
+
+        {saveError && (
+          <p className="text-red-300 text-xs bg-red-900/30 border border-red-800/50 rounded-lg px-3 py-2">
+            {saveError}
+          </p>
+        )}
 
         <button type="submit"
           className="w-full py-3 rounded-xl bg-dusk-400 text-teal-950 font-medium text-sm flex items-center justify-center gap-2 active:scale-[0.98] transition">

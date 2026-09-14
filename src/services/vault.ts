@@ -32,8 +32,6 @@ export const LEGACY_BACKUP_KEY = 'bus_window_scenes.legacy-backup'
 
 const CANARY = 'window-scene-vault:v1'
 const DEFAULT_ITERATIONS = 250_000
-/** 单条密文的合理上限,超过视为长度异常 */
-const MAX_CT_BYTES = 256 * 1024
 
 export type VaultStatus = 'uninitialized' | 'locked' | 'unlocked'
 
@@ -45,6 +43,7 @@ export type VaultErrorCode =
   | 'LOCKED'
   | 'WEAK_PASSPHRASE'
   | 'STORAGE_FULL'
+  | 'VAULT_CHANGED'
 
 export class VaultError extends Error {
   constructor(
@@ -88,6 +87,8 @@ interface VaultFile {
   v: 1
   meta: VaultMeta
   records: VaultRecord[]
+  /** 已删除记录的 id(随机 UUID,不含敏感信息),防止其他页面的旧副本复活删除 */
+  tombstones?: string[]
 }
 
 interface ParsedVault {
@@ -95,6 +96,7 @@ interface ParsedVault {
   goodRecords: VaultRecord[]
   /** 结构/长度就不合法的记录,保留在文件里作为篡改证据,但绝不参与读取 */
   badRecords: VaultRecord[]
+  tombstones: string[]
 }
 
 export interface VaultOptions {
@@ -105,7 +107,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
 
-/** 校验单条密文信封的结构与长度,不合法即视为被篡改 */
+/**
+ * 校验单条密文信封的结构与长度,不合法即视为被外部改动。
+ * 只校验下限(IV 长度、GCM 标签最小长度):密文没有合法上限,
+ * 长记录是正常数据;外部对密文的任何改动由 GCM 认证标签发现。
+ */
 function isValidEnvelope(rec: unknown): rec is VaultRecord {
   if (!isRecord(rec)) return false
   if (typeof rec.id !== 'string' || typeof rec.iv !== 'string' || typeof rec.ct !== 'string') {
@@ -114,7 +120,7 @@ function isValidEnvelope(rec: unknown): rec is VaultRecord {
   const iv = base64ToBytes(rec.iv)
   if (!iv || iv.length !== IV_BYTES) return false
   const ct = base64ToBytes(rec.ct)
-  if (!ct || ct.length < GCM_TAG_BYTES || ct.length > MAX_CT_BYTES) return false
+  if (!ct || ct.length < GCM_TAG_BYTES) return false
   return true
 }
 
@@ -149,6 +155,8 @@ export class Vault {
   private meta: VaultMeta | null = null
   private scenes: WindowScene[] = []
   private badRecords: VaultRecord[] = []
+  /** 本次会话内删除的记录 id:合并时防止被磁盘上的旧副本复活 */
+  private deletedIds = new Set<string>()
   private corruptedCount = 0
   private status: VaultStatus = 'uninitialized'
 
@@ -203,7 +211,10 @@ export class Vault {
     for (const rec of parsed.records) {
       ;(isValidEnvelope(rec) ? goodRecords : badRecords).push(rec as VaultRecord)
     }
-    return { meta, goodRecords, badRecords }
+    const tombstones = Array.isArray(parsed.tombstones)
+      ? parsed.tombstones.filter((t): t is string => typeof t === 'string')
+      : []
+    return { meta, goodRecords, badRecords, tombstones }
   }
 
   /** 用给定口令派生密钥并验证 canary,错口令抛 WRONG_PASSPHRASE */
@@ -230,8 +241,8 @@ export class Vault {
   }
 
   /** 全量重写保险箱文件(单次 setItem,原子;失败则磁盘保持原样) */
-  private writeVaultFile(meta: VaultMeta, records: VaultRecord[]) {
-    const file: VaultFile = { v: 1, meta, records }
+  private writeVaultFile(meta: VaultMeta, records: VaultRecord[], tombstones: string[] = []) {
+    const file: VaultFile = { v: 1, meta, records, tombstones }
     try {
       this.storage.setItem(VAULT_KEY, JSON.stringify(file))
     } catch {
@@ -239,11 +250,81 @@ export class Vault {
     }
   }
 
+  private static sameMeta(a: VaultMeta, b: VaultMeta): boolean {
+    return (
+      a.kdf.salt === b.kdf.salt &&
+      a.kdf.iterations === b.kdf.iterations &&
+      a.verifier.iv === b.verifier.iv &&
+      a.verifier.ct === b.verifier.ct
+    )
+  }
+
+  /**
+   * 磁盘上的保险箱是否已被其他页面/标签重写(典型场景:另一个标签页换了口令)。
+   * 是则本实例的写入必须停止,否则会把别人的口令变更覆盖回去。
+   */
+  hasExternalChanges(): boolean {
+    if (this.status !== 'unlocked' || !this.meta) return false
+    const raw = this.storage.getItem(VAULT_KEY)
+    if (raw === null) return true
+    try {
+      const parsed = JSON.parse(raw)
+      if (!isRecord(parsed)) return true
+      return !Vault.sameMeta(parseMeta(parsed.meta), this.meta)
+    } catch {
+      return true
+    }
+  }
+
+  /** 写盘前的护栏:发现外部已改写保险箱就拒绝,绝不覆盖别人的变更 */
+  private assertNoExternalChanges() {
+    if (this.hasExternalChanges()) {
+      throw new VaultError(
+        'VAULT_CHANGED',
+        '保险箱已在其他窗口更改(如换了口令),本次写入被拒绝',
+      )
+    }
+  }
+
+  /** 把磁盘上的记录与墓碑合并进内存:按 id 去重,内存优先,被删的一律排除 */
+  private async mergeFromDisk() {
+    const disk = this.readVaultFile()
+    const tombstones = new Set([...disk.tombstones, ...this.deletedIds])
+    const merged = new Map<string, WindowScene>()
+    const badRecords = new Map<string, VaultRecord>()
+    for (const rec of [...this.badRecords, ...disk.badRecords]) {
+      badRecords.set(rec.id + rec.ct, rec)
+    }
+    for (const rec of disk.goodRecords) {
+      try {
+        const scene = JSON.parse(await decryptText(this.key!, rec)) as WindowScene
+        if (!tombstones.has(scene.id)) merged.set(scene.id, scene)
+      } catch {
+        // 磁盘上解密失败的记录:保留为损坏证据,不丢也不读
+        badRecords.set(rec.id + rec.ct, rec)
+      }
+    }
+    for (const scene of this.scenes) {
+      // 其他页面已删除的记录(磁盘墓碑)不能留在内存里
+      if (!tombstones.has(scene.id)) merged.set(scene.id, scene)
+    }
+    this.scenes = [...merged.values()]
+    this.badRecords = [...badRecords.values()]
+    this.deletedIds = tombstones
+  }
+
+  /**
+   * 全量重写保险箱。写盘前先读盘:
+   * - 元信息被外部改写(如其他标签页换了口令)→ 拒绝,不覆盖别人的变更;
+   * - 元信息一致 → 与磁盘记录合并后再写,
+   *   这样多个标签页各自新增的记录都不会被对方冲掉。
+   */
   private async persist() {
     this.assertUnlocked()
+    this.assertNoExternalChanges()
+    await this.mergeFromDisk()
     const records = await this.encryptRecords(this.key!, this.scenes)
-    // 已损坏的记录原样保留在文件里,不静默丢弃
-    this.writeVaultFile(this.meta!, [...records, ...this.badRecords])
+    this.writeVaultFile(this.meta!, [...records, ...this.badRecords], [...this.deletedIds])
   }
 
   /** 迁移旧版明文数据:成功导入保险箱后删除明文 key */
@@ -322,6 +403,7 @@ export class Vault {
     this.meta = meta
     this.scenes = legacy
     this.badRecords = []
+    this.deletedIds = new Set()
     this.corruptedCount = 0
     this.status = 'unlocked'
   }
@@ -332,7 +414,7 @@ export class Vault {
    */
   async unlock(passphrase: string): Promise<{ corrupted: number }> {
     if (this.status === 'unlocked') return { corrupted: this.corruptedCount }
-    const { meta, goodRecords, badRecords } = this.readVaultFile()
+    const { meta, goodRecords, badRecords, tombstones } = this.readVaultFile()
     const key = await this.deriveAndVerify(passphrase, meta)
 
     const scenes: WindowScene[] = []
@@ -351,6 +433,7 @@ export class Vault {
     this.meta = meta
     this.scenes = scenes
     this.badRecords = badRecords
+    this.deletedIds = new Set(tombstones)
     this.corruptedCount = corrupted
     this.status = 'unlocked'
 
@@ -364,6 +447,7 @@ export class Vault {
     this.meta = null
     this.scenes = []
     this.badRecords = []
+    this.deletedIds = new Set()
     this.corruptedCount = 0
     this.refreshStatus()
   }
@@ -378,8 +462,12 @@ export class Vault {
     if (!next || next.length < 4) {
       throw new VaultError('WEAK_PASSPHRASE', '新口令至少需要 4 个字符')
     }
+    // 其他窗口若已改写保险箱(如先换过口令),本实例的旧元信息不能覆写回去
+    this.assertNoExternalChanges()
     // 先验证当前口令,错了直接拒绝,不写任何东西
     await this.deriveAndVerify(current, this.meta!)
+    // 把其他标签页刚写入的记录合并进来,换口令不能丢数据
+    await this.mergeFromDisk()
 
     const salt = randomBytes(SALT_BYTES)
     const newKey = await deriveKey(next, salt, this.iterations)
@@ -390,7 +478,7 @@ export class Vault {
     }
     const newRecords = await this.encryptRecords(newKey, this.scenes)
     // 唯一一次写盘;setItem 失败时旧文件原封不动
-    this.writeVaultFile(newMeta, [...newRecords, ...this.badRecords])
+    this.writeVaultFile(newMeta, [...newRecords, ...this.badRecords], [...this.deletedIds])
 
     this.key = newKey
     this.meta = newMeta
@@ -403,11 +491,13 @@ export class Vault {
 
   async addScene(scene: WindowScene): Promise<void> {
     this.assertUnlocked()
+    this.deletedIds.delete(scene.id)
     this.scenes.push(scene)
     try {
       await this.persist()
     } catch (err) {
-      this.scenes.pop()
+      // persist 可能已合并过磁盘记录,按 id 回滚而不是弹栈
+      this.scenes = this.scenes.filter((s) => s.id !== scene.id)
       throw err
     }
   }
@@ -417,9 +507,11 @@ export class Vault {
     const index = this.scenes.findIndex((s) => s.id === id)
     if (index === -1) return
     const [removed] = this.scenes.splice(index, 1)
+    this.deletedIds.add(id)
     try {
       await this.persist()
     } catch (err) {
+      this.deletedIds.delete(id)
       this.scenes.splice(index, 0, removed)
       throw err
     }

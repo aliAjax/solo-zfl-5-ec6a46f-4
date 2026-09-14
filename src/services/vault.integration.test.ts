@@ -66,4 +66,31 @@ describe('真实 localStorage 全流程', () => {
     await vault.unlock('new-secret')
     expect(vault.getScenes()).toHaveLength(1)
   })
+
+  it('真实 localStorage 上的双标签页:长笔记 + 换口令不被旧页回退', async () => {
+    // 标签页 A:设置口令,写一条很长的笔记
+    const tabA = new Vault(undefined, { iterations: 1000 })
+    await tabA.setup('shared-pass')
+    const longNote = '车窗外的故事。'.repeat(50_000)
+    await tabA.addScene(makeScene(longNote))
+
+    // 标签页 B:同一 localStorage,解锁同一保险箱
+    const tabB = new Vault(undefined, { iterations: 1000 })
+    await tabB.unlock('shared-pass')
+
+    // A 换口令;B 随后的写入必须被拒绝,且不能回退口令
+    await tabA.changePassphrase('shared-pass', 'rotated-pass')
+    await expect(tabB.addScene(makeScene('B 的迟到写入'))).rejects.toMatchObject({
+      code: 'VAULT_CHANGED',
+    })
+
+    // 模拟重开:新口令能开,长笔记完整,损坏计数为 0
+    const fresh = new Vault(undefined, { iterations: 1000 })
+    await expect(fresh.unlock('shared-pass')).rejects.toMatchObject({ code: 'WRONG_PASSPHRASE' })
+    const { corrupted } = await fresh.unlock('rotated-pass')
+    expect(corrupted).toBe(0)
+    const notes = fresh.getScenes().map((s) => s.note)
+    expect(notes).toContain(longNote)
+    expect(notes).not.toContain('B 的迟到写入')
+  })
 })

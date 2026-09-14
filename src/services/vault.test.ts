@@ -361,3 +361,121 @@ describe('增删记录', () => {
     expect(scenes[0].id).toBe(b.id)
   })
 })
+
+describe('长记录', () => {
+  it('很长的笔记保存后重新解锁仍完整,不会被误判为篡改', async () => {
+    const vault = makeVault(storage)
+    await vault.setup(PW)
+    // 约 500KB 的笔记,密文超过 256KB(旧的错误上限)
+    const longNote = '窗外形形色色的行人。'.repeat(50_000)
+    const scene = makeScene({ note: longNote })
+    await vault.addScene(scene)
+    await vault.addScene(makeScene({ note: '普通长度' }))
+    vault.lock()
+
+    const { corrupted } = await vault.unlock(PW)
+    expect(corrupted).toBe(0)
+    const scenes = vault.getScenes()
+    expect(scenes).toHaveLength(2)
+    expect(scenes.find((s) => s.id === scene.id)?.note).toBe(longNote)
+  })
+
+  it('长笔记经换口令后依然完整', async () => {
+    const vault = makeVault(storage)
+    await vault.setup(PW)
+    const longNote = '雨点打在玻璃上。'.repeat(40_000)
+    await vault.addScene(makeScene({ note: longNote }))
+    await vault.changePassphrase(PW, 'new-pass-for-long-note')
+    vault.lock()
+
+    const { corrupted } = await vault.unlock('new-pass-for-long-note')
+    expect(corrupted).toBe(0)
+    expect(vault.getScenes()[0].note).toBe(longNote)
+  })
+})
+
+describe('多标签页并发', () => {
+  /** 两个 Vault 实例共享同一存储,模拟同一浏览器里的两个标签页 */
+  async function twoTabs() {
+    const tabA = makeVault(storage)
+    await tabA.setup(PW)
+    await tabA.addScene(makeScene({ note: 'A 页写入的记录' }))
+    const tabB = makeVault(storage)
+    await tabB.unlock(PW)
+    return { tabA, tabB }
+  }
+
+  it('A 页换口令后,B 页保存记录被拒绝,口令变更不被覆盖', async () => {
+    const { tabA, tabB } = await twoTabs()
+    await tabA.changePassphrase(PW, 'new-pass-from-A')
+
+    // B 页(还持有旧密钥)写入必须被拒绝,不能落盘
+    await expect(tabB.addScene(makeScene({ note: 'B 页迟到写入' }))).rejects.toMatchObject({
+      code: 'VAULT_CHANGED',
+    })
+    const existingId = tabB.getScenes()[0].id
+    await expect(tabB.deleteScene(existingId)).rejects.toMatchObject({ code: 'VAULT_CHANGED' })
+
+    // 磁盘上以新口令为准:新口令能开,旧口令不能开
+    const fresh = makeVault(storage)
+    await expect(fresh.unlock(PW)).rejects.toMatchObject({ code: 'WRONG_PASSPHRASE' })
+    await fresh.unlock('new-pass-from-A')
+    const notes = fresh.getScenes().map((s) => s.note)
+    expect(notes).toContain('A 页写入的记录')
+    expect(notes).not.toContain('B 页迟到写入')
+  })
+
+  it('A 页换口令后,B 页再换口令同样被拒绝', async () => {
+    const { tabA, tabB } = await twoTabs()
+    await tabA.changePassphrase(PW, 'new-pass-from-A')
+    await expect(tabB.changePassphrase(PW, 'pass-from-B')).rejects.toMatchObject({
+      code: 'VAULT_CHANGED',
+    })
+    const fresh = makeVault(storage)
+    await fresh.unlock('new-pass-from-A')
+    expect(fresh.getScenes()).toHaveLength(1)
+  })
+
+  it('B 页能感知外部变更(hasExternalChanges)', async () => {
+    const { tabA, tabB } = await twoTabs()
+    expect(tabB.hasExternalChanges()).toBe(false)
+    await tabA.changePassphrase(PW, 'new-pass-from-A')
+    expect(tabB.hasExternalChanges()).toBe(true)
+    // A 页自己的元信息是最新的,不算外部变更
+    expect(tabA.hasExternalChanges()).toBe(false)
+  })
+
+  it('两页都未换口令时,各自的写入照常工作', async () => {
+    const { tabA, tabB } = await twoTabs()
+    await tabB.addScene(makeScene({ note: 'B 页的记录' }))
+    // A 页在 B 之后、且元信息未变,写入不受影响
+    await tabA.addScene(makeScene({ note: 'A 页的第二条' }))
+    const fresh = makeVault(storage)
+    await fresh.unlock(PW)
+    const notes = fresh.getScenes().map((s) => s.note)
+    expect(notes).toContain('B 页的记录')
+    expect(notes).toContain('A 页的第二条')
+  })
+
+  it('A 页换口令时,B 页刚写入的记录一并保留', async () => {
+    const { tabA, tabB } = await twoTabs()
+    await tabB.addScene(makeScene({ note: 'B 页抢在换口令前写入' }))
+    await tabA.changePassphrase(PW, 'new-pass-from-A')
+
+    const fresh = makeVault(storage)
+    await fresh.unlock('new-pass-from-A')
+    expect(fresh.getScenes().map((s) => s.note)).toContain('B 页抢在换口令前写入')
+  })
+
+  it('B 页删除记录后,A 页的写入不会把删掉的记录复活', async () => {
+    const { tabA, tabB } = await twoTabs()
+    const doomed = tabB.getScenes()[0]
+    await tabB.deleteScene(doomed.id)
+    await tabA.addScene(makeScene({ note: 'A 页后写' }))
+
+    const fresh = makeVault(storage)
+    await fresh.unlock(PW)
+    const ids = fresh.getScenes().map((s) => s.id)
+    expect(ids).not.toContain(doomed.id)
+  })
+})

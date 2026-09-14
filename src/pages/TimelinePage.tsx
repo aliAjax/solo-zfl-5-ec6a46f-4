@@ -29,7 +29,12 @@ export default function TimelinePage() {
   )
 
   const handleDelete = async (id: string) => {
-    await deleteScene(id)
+    try {
+      await deleteScene(id)
+    } catch {
+      // 保险箱已在其他窗口更改:本页随即会被锁定,这里只避免静默失败
+      return
+    }
     setDetailScene(null)
   }
 
